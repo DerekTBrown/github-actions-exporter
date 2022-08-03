@@ -10,41 +10,39 @@ import (
 	"strings"
 
 	"github.com/bradleyfalzon/ghinstallation"
-	"github.com/google/go-github/v38/github"
+	"github.com/google/go-github/v45/github"
 	"github.com/gregjones/httpcache"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/oauth2"
 )
 
 var (
-	client                   *github.Client
-	err                      error
-	workflowRunStatusGauge   *prometheus.GaugeVec
-	workflowRunDurationGauge *prometheus.GaugeVec
+	client *github.Client
+	err    error
 )
 
 // InitMetrics - register metrics in prometheus lib and start func for monitor
 func InitMetrics() {
-	workflowRunStatusGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "github_workflow_run_status",
-			Help: "Workflow run status",
-		},
-		strings.Split(config.WorkflowFields, ","),
-	)
-	workflowRunDurationGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "github_workflow_run_duration_ms",
-			Help: "Workflow run duration (in milliseconds)",
-		},
-		strings.Split(config.WorkflowFields, ","),
-	)
+	workflowRunCollector := &WorkflowRunCollector{
+		runStatusDesc: prometheus.NewDesc(
+			"github_workflow_run_status_12h",
+			"Workflow run status of all workflow runs created in the last 12hr",
+			nil,
+			nil,
+		),
+		durationDesc: prometheus.NewDesc(
+			"github_workflow_run_duration_ms",
+			"Workflow run duration (in milliseconds) of all workflow runs created in the last 12hr",
+			nil,
+			nil,
+		),
+	}
+
 	prometheus.MustRegister(runnersGauge)
 	prometheus.MustRegister(runnersOrganizationGauge)
-	prometheus.MustRegister(workflowRunStatusGauge)
-	prometheus.MustRegister(workflowRunDurationGauge)
 	prometheus.MustRegister(workflowBillGauge)
 	prometheus.MustRegister(runnersEnterpriseGauge)
+	prometheus.MustRegister(workflowRunCollector)
 
 	client, err = NewClient()
 	if err != nil {
@@ -62,7 +60,6 @@ func InitMetrics() {
 	go getBillableFromGithub()
 	go getRunnersFromGithub()
 	go getRunnersOrganizationFromGithub()
-	go getWorkflowRunsFromGithub()
 	go getRunnersEnterpriseFromGithub()
 }
 

@@ -6,10 +6,14 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/google/go-github/v38/github"
+	"github.com/google/go-github/v45/github"
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+var wg sync.WaitGroup
 
 // getFieldValue return value from run element which corresponds to field
 func getFieldValue(repo string, run github.WorkflowRun, field string) string {
@@ -58,10 +62,15 @@ func getRelevantFields(repo string, run *github.WorkflowRun) []string {
 	return result
 }
 
-func getAllWorkflowRuns(owner string, repo string) []*github.WorkflowRun {
-	var runs []*github.WorkflowRun
-	opt := &github.ListWorkflowRunsOptions{ListOptions: github.ListOptions{PerPage: 200}}
+func getWorkflowRunsLastHr(owner string, repo string) []*github.WorkflowRun {
+	window_start := time.Now().Add(time.Duration(-12) * time.Hour).Format(time.RFC3339)
 
+	opt := &github.ListWorkflowRunsOptions{
+		ListOptions: github.ListOptions{PerPage: 200},
+		Created:     ">=" + window_start,
+	}
+
+	var runs []*github.WorkflowRun
 	for {
 		resp, rr, err := client.Actions.ListRepositoryWorkflowRuns(context.Background(), owner, repo, opt)
 		if rl_err, ok := err.(*github.RateLimitError); ok {
@@ -98,44 +107,74 @@ func getRunUsage(owner string, repo string, runId int64) *github.WorkflowRunUsag
 	}
 }
 
-// getWorkflowRunsFromGithub - return informations and status about a workflow
-func getWorkflowRunsFromGithub() {
-	for {
-		for _, repo := range repositories {
-			r := strings.Split(repo, "/")
-			runs := getAllWorkflowRuns(r[0], r[1])
+func getConclusionLabel(run *github.WorkflowRun) float64 {
+	if run.GetConclusion() == "success" {
+		return 1
+	} else if run.GetConclusion() == "skipped" {
+		return 2
+	} else if run.GetConclusion() == "in_progress" {
+		return 3
+	} else if run.GetConclusion() == "queued" {
+		return 4
+	}
+	return 0
+}
 
-			for _, run := range runs {
-				var s float64 = 0
-				if run.GetConclusion() == "success" {
-					s = 1
-				} else if run.GetConclusion() == "skipped" {
-					s = 2
-				} else if run.GetConclusion() == "in_progress" {
-					s = 3
-				} else if run.GetConclusion() == "queued" {
-					s = 4
-				}
+type WorkflowRunCollector struct {
+	runStatusDesc *prometheus.Desc
+	durationDesc  *prometheus.Desc
+}
 
-				fields := getRelevantFields(repo, run)
+func (c *WorkflowRunCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.runStatusDesc
+	ch <- c.durationDesc
+}
 
-				workflowRunStatusGauge.WithLabelValues(fields...).Set(s)
+func (c *WorkflowRunCollector) collectForRepository(ch chan<- prometheus.Metric, repo string) {
+	defer wg.Done()
 
-				var run_usage *github.WorkflowRunUsage = nil
-				if config.Metrics.FetchWorkflowRunUsage {
-					run_usage = getRunUsage(r[0], r[1], *run.ID)
-				}
-				if run_usage == nil { // Fallback for Github Enterprise
-					created := run.CreatedAt.Time.Unix()
-					updated := run.UpdatedAt.Time.Unix()
-					elapsed := updated - created
-					workflowRunDurationGauge.WithLabelValues(fields...).Set(float64(elapsed * 1000))
-				} else {
-					workflowRunDurationGauge.WithLabelValues(fields...).Set(float64(run_usage.GetRunDurationMS()))
-				}
-			}
+	r := strings.Split(repo, "/")
+	runs := getWorkflowRunsLastHr(r[0], r[1])
+
+	for _, run := range runs {
+		fields := getRelevantFields(repo, run)
+
+		runStatusMetric, err := prometheus.NewConstMetric(c.runStatusDesc, prometheus.GaugeValue, getConclusionLabel(run), fields...)
+		if err != nil {
+			log.Printf("Error creating runStatusMetric: %s", err.Error())
+		} else {
+			ch <- runStatusMetric
 		}
 
-		time.Sleep(time.Duration(config.Github.Refresh) * time.Second)
+		// Compute workflow run usage
+		var run_usage *github.WorkflowRunUsage = nil
+		var run_duration float64
+		if config.Metrics.FetchWorkflowRunUsage {
+			run_usage = getRunUsage(r[0], r[1], *run.ID)
+		}
+		if run_usage == nil { // Fallback for Github Enterprise
+			created := run.CreatedAt.Time.Unix()
+			updated := run.UpdatedAt.Time.Unix()
+			run_duration = float64((updated - created) * 1000)
+		} else {
+			run_duration = float64(run_usage.GetRunDurationMS())
+		}
+
+		runDurationMetric, err := prometheus.NewConstMetric(c.runStatusDesc, prometheus.GaugeValue, run_duration, fields...)
+		if err != nil {
+			log.Printf("Error creating runDurationMetric: %s", err.Error())
+		} else {
+			ch <- runDurationMetric
+		}
 	}
+}
+
+func (c *WorkflowRunCollector) Collect(ch chan<- prometheus.Metric) {
+
+	repos_to_process := repositories
+	for _, repo := range repos_to_process {
+		wg.Add(1)
+		go c.collectForRepository(ch, repo)
+	}
+	wg.Wait()
 }
